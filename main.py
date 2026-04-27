@@ -35,12 +35,10 @@ def load_model():
 # ─────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     load_model()
     RISK_SCORE_METRIC.labels(identifier="system_startup").set(0)
     LOGIN_FAILURES.labels(method="password", reason="none").inc(0)
     yield
-    # Shutdown
     r.close()
 
 app = FastAPI(lifespan=lifespan)
@@ -62,6 +60,9 @@ ML_BLOCKED        = Counter("ml_blocked_total",            "Requests blocked by 
 WINDOW    = 100     # Rate limit window in seconds
 LIMIT     = 10000   # Max requests in window
 THRESHOLD = 30      # Risk score threshold for blocking
+
+# Paths that bypass all security checks (health/monitoring endpoints)
+EXEMPT_PATHS = {"/", "/metrics", "/status"}
 
 # ─────────────────────────────────────────────
 # UTILITY FUNCTIONS
@@ -136,8 +137,8 @@ def analyze_behavioral_ai(request: Request) -> float:
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
 
-    # Allow health checks and metrics without inspection
-    if request.url.path in ["/", "/metrics"]:
+    # FIX 1: Exempt health/monitoring endpoints — /status added alongside /metrics
+    if request.url.path in EXEMPT_PATHS:
         return await call_next(request)
 
     REQUESTS.labels(method=request.method, endpoint=request.url.path).inc()
@@ -151,6 +152,11 @@ async def security_middleware(request: Request, call_next):
     r.zremrangebyscore(rate_key, 0, now - WINDOW)
     r.expire(rate_key, WINDOW + 10)
 
+    # FIX 2: Resolve legitimate-user bypass BEFORE any blocking logic.
+    # This ensures X-Legitimate-User: true is honoured even when the ML
+    # model would otherwise block the request.
+    is_legitimate = request.headers.get("X-Legitimate-User") == "true"
+
     # ── ML-based detection (if model available) ───────────────
     if bot_model is not None:
         features = extract_features(request, identifier)
@@ -160,6 +166,11 @@ async def security_middleware(request: Request, call_next):
         BOT_PROBABILITY.labels(identifier=identifier).set(probability)
 
         if prediction == 1:
+            if is_legitimate:
+                # Counted as a false positive — let through
+                FALSE_POSITIVES.labels(identifier=identifier).inc()
+                return await call_next(request)
+
             ML_BLOCKED.labels(identifier=identifier).inc()
             BLOCKED.labels(reason="ml_bot_detected", identifier=identifier).inc()
             return Response(
@@ -175,7 +186,7 @@ async def security_middleware(request: Request, call_next):
     final_score = float(r.get(f"risk:{identifier}") or 0)
 
     if final_score > THRESHOLD:
-        if request.headers.get("X-Legitimate-User") == "true":
+        if is_legitimate:
             FALSE_POSITIVES.labels(identifier=identifier).inc()
             return await call_next(request)
 
@@ -207,13 +218,11 @@ async def login(request: Request, username: str = None, password: str = None):
     identifier = get_identifier(request)
 
     if username == "admin" and password == "secret123":
-        # Reset fail counter on successful login
         r.delete(f"fails:{identifier}")
         return {"message": "Welcome", "status": "success"}
 
-    # Track failed login in Redis for ML feature
     r.incr(f"fails:{identifier}")
-    r.expire(f"fails:{identifier}", 600)   # 10 min TTL
+    r.expire(f"fails:{identifier}", 600)
 
     update_risk_score(identifier, 10)
     LOGIN_FAILURES.labels(method="password", reason="invalid_credentials").inc()
